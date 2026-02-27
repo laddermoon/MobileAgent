@@ -3,19 +3,18 @@ import uuid
 import json
 import time
 import argparse
-from PIL import Image
 from datetime import datetime
 
 from utils.mobile_agent_e import (
-    InfoPool, 
-    Manager, 
-    Executor, 
-    Notetaker, 
+    InfoPool,
+    Manager,
+    Executor,
+    Notetaker,
     ActionReflector,
     INPUT_KNOW
 )
 import utils.controller as controller
-from utils.aliyun_guiplus_wrapper import AliyunGUIPlusWrapper
+from utils.aliyun_guiplus_wrapper import AliyunGUIPlusWrapper, smart_size
 
 def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, add_info, coor_type, if_notetaker, max_step=25, log_path="./logs"):
     if adb_path and hdc_path:
@@ -37,12 +36,17 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
     image_save_path = os.path.join(save_path, "images")
     os.mkdir(image_save_path)
 
+    # 坐标转换参数（与阿里云API保持一致）
+    COOR_FACTOR = 28
+    MIN_PIXELS = 4 * 28 * 28
+    MAX_PIXELS = 1280 * 28 * 28
+
     info_pool = InfoPool(
         additional_knowledge_manager=add_info,
         additional_knowledge_executor=INPUT_KNOW,
         err_to_manager_thresh=2
     )
-    
+
     vllm = AliyunGUIPlusWrapper(api_key=api_key, model_name="gui-plus")
     manager = Manager()
     executor = Executor()
@@ -75,9 +79,7 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
                 time.sleep(5)
             else:
                 break
-        
-        width, height = Image.open(local_image_dir).size
-        
+
         info_pool.error_flag_plan = False
         err_to_manager_thresh = info_pool.err_to_manager_thresh
         if len(info_pool.action_outcomes) >= err_to_manager_thresh:
@@ -99,11 +101,11 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
         if not skip_manager:
             print("\n### Manager ... ###\n")
             prompt_planning = manager.get_prompt(info_pool)
-            output_planning, message_manager, raw_response = vllm.predict_mm(
+            output_planning, message_manager, raw_response, image_sizes = vllm.predict_mm(
                 prompt_planning,
                 [local_image_dir]
             )
-        
+
         message_save_path = os.path.join(save_path, f"step_{step+1}")
         os.mkdir(message_save_path)
         message_file = os.path.join(message_save_path, "manager.json")
@@ -116,11 +118,11 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
         info_pool.plan = parsed_result_planning['plan']
         if not raw_response:
             raise RuntimeError('Error calling vLLM in planning phase.')
-        
+
         print('Completed subgoal: ' + info_pool.completed_plan)
         print('Planning thought: ' + parsed_result_planning['thought'])
         print('Plan: ' + info_pool.plan, "\n")
-        
+
         if "Finished" in info_pool.plan.strip() and len(info_pool.plan.strip()) < 15:
             print("Instruction finished, stop the process.")
             task_result_path = os.path.join(save_path, "task_result.json")
@@ -134,19 +136,19 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
             print("\n### Operator ... ###\n")
 
             prompt_action = executor.get_prompt(info_pool)
-            output_action, message_operator, raw_response = vllm.predict_mm(
+            output_action, message_operator, raw_response, image_sizes = vllm.predict_mm(
                 prompt_action,
                 [local_image_dir],
             )
-            
+
             if not raw_response:
                 raise RuntimeError('Error calling LLM in operator phase.')
             parsed_result_action = executor.parse_response(output_action)
             action_thought, action_object_str, action_description = parsed_result_action['thought'], parsed_result_action['action'], parsed_result_action['description']
-            
+
             info_pool.last_action_thought = action_thought
             info_pool.last_summary = action_description
-            
+
             if (not action_thought) or (not action_object_str):
                 print('Action prompt output is not in the correct format.')
                 info_pool.last_action = {"action": "invalid"}
@@ -155,7 +157,7 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
                 info_pool.action_outcomes.append("C")
                 info_pool.error_descriptions.append("invalid action format, do nothing.")
                 continue
-        
+
         action_object_str = action_object_str.replace("```", "").replace("json", "").strip()
         print('Thought: ' + action_thought)
         print('Action: ' + action_object_str)
@@ -171,7 +173,7 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
 
 ### Description ###
 {action_description}'''
-            
+
             if action_object['action'] == "answer":
                 message_file = os.path.join(message_save_path, "operator.json")
                 message_data = {"name": "operator", "messages": message_operator, "response": operator_response, "step_id": step+1}
@@ -187,12 +189,34 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
                 with open(task_result_path, 'w', encoding='utf-8') as json_file:
                     json.dump(task_result_data, json_file, ensure_ascii=False, indent=4)
                 break
-            
-            if coor_type != "abs":
+
+            # 使用 smart_size 进行坐标转换
+            if coor_type != "abs" and image_sizes:
+                # 获取原始图片尺寸
+                orig_width, orig_height, _ = image_sizes[0]
+
                 if "coordinate" in action_object:
-                    action_object['coordinate'] = [int(action_object['coordinate'][0] / 1000 * width), int(action_object['coordinate'][1] / 1000 * height)]
+                    # action_object['coordinate'] 格式: [x, y]，需要转换为 {"x": x, "y": y}
+                    point = {"x": action_object['coordinate'][0], "y": action_object['coordinate'][1]}
+                    abs_x, abs_y = smart_size(
+                        orig_height, orig_width, point,
+                        factor=COOR_FACTOR,
+                        min_pixels=MIN_PIXELS,
+                        max_pixels=MAX_PIXELS,
+                        vl_high_resolution_images=False
+                    )
+                    action_object['coordinate'] = [abs_x, abs_y]
+
                 if "coordinate2" in action_object:
-                    action_object['coordinate2'] = [int(action_object['coordinate2'][0] / 1000 * width), int(action_object['coordinate2'][1] / 1000 * height)]
+                    point = {"x": action_object['coordinate2'][0], "y": action_object['coordinate2'][1]}
+                    abs_x, abs_y = smart_size(
+                        orig_height, orig_width, point,
+                        factor=COOR_FACTOR,
+                        min_pixels=MIN_PIXELS,
+                        max_pixels=MAX_PIXELS,
+                        vl_high_resolution_images=False
+                    )
+                    action_object['coordinate2'] = [abs_x, abs_y]
             
             if action_object['action'] == "click":
                 controller.tap(action_object['coordinate'][0], action_object['coordinate'][1])
@@ -240,7 +264,7 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
         
         print("\n### Action Reflector ... ###\n")
         prompt_action_reflect = action_reflector.get_prompt(info_pool)
-        output_action_reflect, message_reflector, raw_response = vllm.predict_mm(
+        output_action_reflect, message_reflector, raw_response, _ = vllm.predict_mm(
             prompt_action_reflect,
             [
                 local_image_dir,
@@ -282,7 +306,7 @@ def run_instruction(adb_path, hdc_path, api_key, base_url, model, instruction, a
         if action_outcome == "A" and if_notetaker:
             print("\n### NoteKeeper ... ###\n")
             prompt_note = notetaker.get_prompt(info_pool)
-            output_note, message_notekeeper, raw_response = vllm.predict_mm(
+            output_note, message_notekeeper, raw_response, _ = vllm.predict_mm(
                 prompt_note,
                 [local_image_dir2],
             )
